@@ -114,8 +114,6 @@ def update_gas_cylinder(id):
     return jsonify({"message": "Gas Cylinder not found!"})
 
 
-
-
 @app.route('/cylinders/<int:id>', methods=['DELETE'])
 @jwt_required()
 def delete_gas_cylinder(id):
@@ -126,11 +124,42 @@ def delete_gas_cylinder(id):
         return jsonify({"message":"Gas Cylinder deleted successfully"}), 200
     return jsonify({"message":"Gas Cylinder not found!"}), 404
 
+@app.route('/uploads/<filename>')
+def uploaded_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+
+#Mpesa payment helper functions
+def get_access_token():
+    url = "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials"
+    response = requests.get(url, auth=HTTPBasicAuth(app.config['MPESA_CONSUMER_KEY'], app.config['MPESA_CONSUMER_SECRET']))
+    
+    if response.status_code == 200:
+        return response.json()['access_token']
+    else:
+        return jsonify(f"Failed to get access token: {response.status_code}, {response.text}")
+
+def get_password():
+    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    data_to_encode = app.config['MPESA_BUSINESS_SHORT_CODE'] + app.config['MPESA_PASS_KEY'] + timestamp
+    return base64.b64encode(data_to_encode.encode()).decode('utf-8')
+
+def format_phone_number(number):
+    if number.startswith('0'):
+        return f'254{number[1:]}'
+    elif number.startswith('254'):
+        return number
+    else:
+        raise ValueError("Invalid phone number format")
+
+
+
 @app.route('/cylinders/<int:id>/buy', methods=['POST'])
 @jwt_required()
 def buy_gas_cylinder(id):
-    current_user = get_jwt_identity()
-    user = User.query.get(current_user['id'])
+    data = request.get_json()
+    current_user = get_jwt_identity()['id']
+    user = User.query.get(current_user)
     if not user:
         return jsonify({"message": "User not found!"}), 404
     gas_cylinder = GasCylinder.query.get(id)
@@ -138,14 +167,109 @@ def buy_gas_cylinder(id):
     if not gas_cylinder:
         return jsonify({"message": "Gas Cylinder not found"}), 404
     
-    # Create Order record
-    order = Order(user_id=user.id, gas_cylinder_id=gas_cylinder.id, price_paid=gas_cylinder.buying_price,order_type="BUY")
-    db.session.add(order)
+    amount = gas_cylinder.buying_price
+    phone_number = data.get('phone_number')
     
-    #other logicals
+    try:
+        formatted_phone_number = format_phone_number(phone_number)
+    except ValueError:
+        return jsonify({'message': 'Invalid phone number format'}), 400
+    
+        # Initiate M-Pesa payment
+    access_token = get_access_token()
+    if not access_token:
+        return jsonify({'message': 'Failed to get access token for payment. Please try again.'}), 500
 
-    db.session.commit()
-    return jsonify({"message": "You have successfully purchased this cylinder! "})
+    password = get_password()
+    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+
+    payload = {
+        "BusinessShortCode": app.config['MPESA_BUSINESS_SHORT_CODE'],
+        "Password": password,
+        "Timestamp": timestamp,
+        "TransactionType": app.config['MPESA_TRANSACTION_TYPE'],
+        "Amount": amount,
+        "PartyA": formatted_phone_number,
+        "PartyB": app.config['MPESA_BUSINESS_SHORT_CODE'],
+        "PhoneNumber": formatted_phone_number,
+        "CallBackURL": app.config['MPESA_CALLBACK_URL'],
+        "AccountReference": f"GasHub",
+        "TransactionDesc": f"Payment for Cylinder {gas_cylinder.cylinder_type}"
+    }
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    #print(f"M-Pesa request payload: {payload}")
+
+    response = requests.post(
+        "https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest",
+        json=payload,
+        headers=headers
+    )
+    
+    if response.status_code == 200:
+        mpesa_response = response.json()
+        #print(f"mpesa response:{mpesa_response}")
+
+        # Create Order record
+        order = Order(user_id=user.id, 
+                      gas_cylinder_id=gas_cylinder.id, 
+                      price_paid=amount,
+                      order_type="BUY",
+                      merchant_request_id=mpesa_response.get('MerchantRequestID'),
+                      checkout_request_id=mpesa_response.get('CheckoutRequestID'))
+        db.session.add(order)
+        
+        #other logicals
+
+        db.session.commit()
+        return jsonify({"message": "You have successfully purchased this cylinder! "}),200
+    else:
+        return jsonify({'message': 'Failed to initiate payment. Please try again.'}), 400
+    
+
+@app.route('/mpesa-callback', methods=['POST'])
+def mpesa_callback():
+    try:
+        data = request.get_json()
+        print(f"Callback data received: {data}")
+
+        result_code = data['Body']['stkCallback']['ResultCode']
+        merchant_request_id = data['Body']['stkCallback']['MerchantRequestID']
+
+        
+        order = Order.query.filter_by(merchant_request_id=merchant_request_id).first()
+        if not order:
+            print(f"No booking found for MerchantRequestID: {merchant_request_id}")
+            return jsonify({'message': 'Booking not found'}), 404
+
+        if result_code == 0:  # Successful payment
+            mpesa_receipt_number = data['Body']['stkCallback']['CallbackMetadata']['Item'][1]['Value']
+    
+            order.payment_status = 'completed'
+            order.mpesa_receipt_number = mpesa_receipt_number
+
+            #update booked status
+
+            # gas_cylinder = GasCylinder.query.get(order.space_id)
+            # if gas_cylinder:
+            #     gas_cylinder.booked = True
+
+            db.session.commit()
+            print(f"Payment successful for booking ID {order.id}")
+        else:
+            order.payment_status = 'failed'
+            db.session.commit()
+            print(f"Payment failed for booking ID {order.id}")
+
+        return jsonify({'message': 'Callback processed successfully'}), 200
+
+    except Exception as e:
+        print(f"Error in mpesa_callback: {str(e)}")
+        return jsonify({'message': 'Error processing callback'}), 500
 
 
 

@@ -51,6 +51,10 @@ class Order(db.Model,SerializerMixin):
     purchase_date = db.Column(db.DateTime, default=datetime.utcnow)
     order_type = db.Column(db.String(10),nullable=False)
     price_paid = db.Column(db.Float, nullable=False)
+    payment_status = db.Column(db.String(20), default='pending')
+    mpesa_receipt_number = db.Column(db.String(50), nullable=True)
+    merchant_request_id = db.Column(db.String(50), nullable=True)
+    checkout_request_id = db.Column(db.String(50), nullable=True)
     
     user = db.relationship('User', backref=db.backref('orders', lazy=True))
     gas_cylinder = db.relationship('GasCylinder', backref=db.backref('orders', lazy=True))
